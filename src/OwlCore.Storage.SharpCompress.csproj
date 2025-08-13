@@ -38,7 +38,7 @@
   <PropertyGroup>
     <Author>Joshua Askharoun</Author>
     <Authors>$(Author)</Authors>
-    <Version>0.1.2</Version>
+  <Version>0.1.3</Version>
     <Product>OwlCore</Product>
     <DebugType>embedded</DebugType>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
@@ -52,6 +52,24 @@
       Reading and writing GZip archives is partially supported with the same limitations as SharpCompress.
     </Description>
     <PackageReleaseNotes>
+      --- 0.1.3 ---
+      [New]
+      Added overload constructors to open archives from an IFile with an external backing stream for tracked lifecycle and flush support.
+      Exposed stream ownership hooks to inheritors (`RootStream`, `CompositeStream`, and optional `BackingStream`).
+
+      [Improvements]
+      Layered archive handling for `.tar.gz`/`.tgz`: manual GZip decompression and TAR-first factory ordering based on filename hints to avoid Zip detection stalls.
+      Format-aware flush/save: selects `CompressionType` per format and streams directly to GZip without intermediate buffers; ensures GZip footer emission and durability.
+      Archive creation now returns an `ArchiveFolder` bound to the source file, enabling `CanFlush` and correct disposal semantics. 
+      Proactive handle management: disposes composite/root streams before persisting changes to release file locks on Windows.
+
+      [Fixes]
+      Resolved empty TAR enumeration caused by using compressed lengths after GZip; supply an estimated decompressed length to `LengthOverrideStream`.
+      Eliminated hang when probing `.tar.gz` by prioritizing TAR factory after decompression.
+
+      [Notes]
+      Validated end-to-end with OwlCore.Storage.Mcp archive mounting and writable workflows. Additive writes are supported; in-place modification of existing entries remains limited by format/library behavior.
+
       --- 0.1.2 ---
       [New]
       Added helper methods and matching `IFolder` extensions for creating and flushing archives.

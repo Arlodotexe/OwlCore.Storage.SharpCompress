@@ -1,5 +1,4 @@
-﻿
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -27,11 +26,35 @@ public class ReadOnlyArchiveFolder : IFolder, IChildFolder, IGetItem, IGetFirstB
     internal const char ZIP_DIRECTORY_SEPARATOR = '/';
 
     protected IFile? SourceFile { get; }
-    
+    protected Stream? BackingStream { get; }
+
     private readonly string _key;
     private readonly IFolder? _parent;
     private IArchive? _archive;
     private Dictionary<string, IChildFolder>? _subfolders;
+
+    // Streams we create when opening from a SourceFile (ownership stays with this folder)
+    private Stream? _rootStream;           // The original stream returned by SourceFile.OpenStreamAsync
+    private Stream? _compositeStream;      // The top-most wrapped rewindable/decompression stream actually passed to Factory.Open
+    private bool _ownsStreams;             // True when we created the streams (SourceFile ctor path)
+
+    protected Stream? RootStream 
+    { 
+        get => _rootStream; 
+        set => _rootStream = value; 
+    }
+    
+    protected Stream? CompositeStream 
+    { 
+        get => _compositeStream; 
+        set => _compositeStream = value; 
+    }
+    
+    protected bool OwnsStreams 
+    { 
+        get => _ownsStreams; 
+        set => _ownsStreams = value; 
+    }
 
     public string Id { get; }
     public string Name { get; }
@@ -46,6 +69,15 @@ public class ReadOnlyArchiveFolder : IFolder, IChildFolder, IGetItem, IGetFirstB
         : this(sourceFile.Id.Hash(), Path.GetFileNameWithoutExtension(sourceFile.Name))
     {
         SourceFile = sourceFile;
+        _ownsStreams = true;
+    }
+
+    public ReadOnlyArchiveFolder(IFile sourceFile, Stream backingStream)
+        : this(sourceFile.Id.Hash(), Path.GetFileNameWithoutExtension(sourceFile.Name))
+    {
+        SourceFile = sourceFile;
+        BackingStream = backingStream;
+        _ownsStreams = true;
     }
 
     protected ReadOnlyArchiveFolder(ReadOnlyArchiveFolder parent, string name) : this(parent._archive!, CombinePath(true, parent.Id, name), name)
@@ -195,9 +227,23 @@ public class ReadOnlyArchiveFolder : IFolder, IChildFolder, IGetItem, IGetFirstB
             if (SourceFile is null)
                 throw new InvalidOperationException("ArchiveFolder requires either an archive or file.");
 
+            // Base file stream (never wrapped yet)
+            // track ownership
             var archiveStream = await SourceFile.OpenStreamAsync(FileAccess.Read, cancellationToken);
-
-            Stream rewindableStream = new LazySeekStream(archiveStream);
+            _rootStream = archiveStream;
+            
+            Stream rewindableStream;
+            if (BackingStream != null)
+            {
+                // Use provided backing stream for writes
+                rewindableStream = new LazySeekStream(archiveStream, BackingStream);
+            }
+            else
+            {
+                // Fallback to memory-based backing stream (read-only scenario)
+                rewindableStream = new LazySeekStream(archiveStream);
+            }
+            
             rewindableStream = new LengthOverrideStream(rewindableStream, archiveStream.Length);
             rewindableStream.Position = 0;
 
@@ -205,16 +251,75 @@ public class ReadOnlyArchiveFolder : IFolder, IChildFolder, IGetItem, IGetFirstB
             {
                 rewindableStream.Position = 0;
 
+                // Decompression chain (still backed by _rootStream)
                 rewindableStream = new GZipStream(rewindableStream, CompressionMode.Decompress);
-                rewindableStream = new LengthOverrideStream(rewindableStream, archiveStream.Length);
+                
+                // Estimate decompressed length to handle extreme compression ratios
+                // 20x covers pathological cases (95% compression) while ensuring minimum TAR detection size
+                long estimatedLength = Math.Max(archiveStream.Length * 20, 1024);
+                rewindableStream = new LengthOverrideStream(rewindableStream, estimatedLength);
                 rewindableStream = new LazySeekStream(rewindableStream);
 
                 rewindableStream.Position = 0;
             }
 
+            // final stream handed to SharpCompress
+            // we will manually dispose in Dispose()
+            _compositeStream = rewindableStream;
             var options = new ReaderOptions { LeaveStreamOpen = true };
+            
+            // NOTE ON FACTORY ORDERING & LAYERED FORMATS (TAR.GZ/TGZ)
+            // -----------------------------------------------------------------------------
+            // SharpCompress exposes a set of IArchiveFactory implementations (ZipFactory, TarFactory, etc.)
+            // via Factory.Factories. The default ordering is NOT guaranteed and ZipFactory commonly
+            // appears before TarFactory. After we transparently decompress a .tar.gz stream, the resulting
+            // inner stream now contains *raw TAR bytes*, but SharpCompress has no context that we already
+            // performed a GZip decompression step externally.
+            //
+            // Consequence:
+            //  - If we naively iterate factories in default order, ZipFactory.IsArchive() is invoked on TAR data.
+            //  - Zip detection can perform multi-pass scanning and, on certain non-ZIP inputs, may block for
+            //    a long time (observed hang) while attempting to validate central directory structures that
+            //    simply do not exist in TAR.
+            //  - This produced the production hang we captured in logs: detection stopped at
+            //      "Trying factory ZipFactory" and never progressed to TarFactory.
+            //
+            // Design Implications:
+            //  - We must supply *semantic hints* derived from the original filename extension BEFORE we stripped
+            //    the compression layer. Relying purely on content sniffing after manual decompression introduces
+            //    pathological detection paths.
+            //  - We intentionally re-order the factories placing TarFactory first when the original filename
+            //    ended with .tar.gz/.tgz. This is a pragmatic mitigation that avoids modifying SharpCompress internals.
+            //  - Future layered formats (e.g., .tar.bz2, nested .zip.gz) will require extending this heuristic.
+            //
+            // Guarantees & Trade-offs:
+            //  - Safe: TarFactory.IsArchive() on non-TAR is inexpensive and returns quickly.
+            //  - Prevents: Long-running ZipFactory probes on TAR streams.
+            //  - Limitation: If user renames a non-TAR GZip file to .tar.gz incorrectly, we may mis-prioritize
+            //    TarFactory first (still falls back gracefully to others if TarFactory rejects).
+            //
+            // Maintenance Guidance:
+            //  - DO NOT remove or reorder this prioritization without re-validating against TAR.GZ remount tests.
+            //  - If adding new compression layers (BZ2/XZ), replicate extension-based ordering here.
+            //  - If SharpCompress adds a native layered archive abstraction in the future, revisit this logic.
+            // ----------------------------------------------------------------------------
 
-            foreach (var factory in Factory.Factories.OfType<IArchiveFactory>())
+            // Get all available archive factories
+            var allFactories = Factory.Factories.OfType<IArchiveFactory>().ToList();
+            
+            // For .tar.gz/.tgz files (where we've decompressed), prioritize TAR factory
+            var orderedFactories = allFactories;
+            if (SourceFile?.Name.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase) == true ||
+                SourceFile?.Name.EndsWith(".tgz", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                var tarFactory = allFactories.FirstOrDefault(f => f.GetType().Name.Contains("Tar"));
+                if (tarFactory != null)
+                {
+                    orderedFactories = new[] { tarFactory }.Concat(allFactories.Where(f => f != tarFactory)).ToList();
+                }
+            }
+
+            foreach (var factory in orderedFactories)
             {
                 rewindableStream.Position = 0;
                 if (factory.IsArchive(rewindableStream, options.Password))
@@ -230,10 +335,9 @@ public class ReadOnlyArchiveFolder : IFolder, IChildFolder, IGetItem, IGetFirstB
 
         if (_archive is null)
             throw new ArgumentNullException(nameof(_archive));
-
-        
+            
         cancellationToken.ThrowIfCancellationRequested();
-
+        
         return _archive;
     }
 
@@ -301,7 +405,18 @@ public class ReadOnlyArchiveFolder : IFolder, IChildFolder, IGetItem, IGetFirstB
     /// <inheritdoc />
     public void Dispose()
     {
+        // Dispose archive first (may flush internal state)
         _archive?.Dispose();
         _archive = null;
+
+        if (_ownsStreams)
+        {
+            // Disposing the top-most composite stream (LazySeekStream/GZip/LengthOverride chain)
+            // will cascade disposal to all inner wrapped streams including the original file stream.
+            try { _compositeStream?.Dispose(); } catch { }
+        }
+
+        _compositeStream = null;
+        _rootStream = null;
     }
 }
